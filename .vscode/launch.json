@@ -1,0 +1,38 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+
+    {
+      "name": "Run main_script (config_file)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/code/main_script.py",
+      "args": [
+        "-c",
+        "${workspaceFolder}/configs/config_file.yaml"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/code"
+      },
+      "console": "integratedTerminal"
+    },
+
+    {
+      "name": "Run main_script (trained_mdl)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/code/main_script.py",
+      "args": [
+        "-c",
+        "${workspaceFolder}/configs/config_file_trained_mdl.yaml"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/code"
+      },
+      "console": "integratedTerminal"
+    }
+
+  ]
+}
