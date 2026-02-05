@@ -1,6 +1,8 @@
 from data_import import load_all_data
 import numpy as np
 from scipy.stats import rankdata, pearsonr
+import matplotlib.pyplot as plt
+
 
 X_train, y_train, X_T1, y_T1, X_T2, y_T2 = load_all_data(
     train_mat_path=r"C:\Users\mnaser1\OneDrive - Kennesaw State University\Desktop\ASDSpeech-main - 2\data\training\train_data.mat",
@@ -51,5 +53,3 @@ rho, p_s = pearsonr(rankdata(x), rankdata(y))
 print("Spearman rho:", rho)
 print("Spearman p-value:", p_s)
 
-
-stop=1
