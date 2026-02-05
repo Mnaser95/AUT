@@ -18,49 +18,82 @@ X_train, y_train, X_T1, y_T1, X_T2, y_T2 = load_all_data(
 # FLATTEN WINDOWS
 # =========================
 X_train_flat = X_train.reshape(X_train.shape[0], -1, X_train.shape[-1])  # (N,1000,49)
-N, W, F = X_train_flat.shape
+X_T1_flat    = X_T1.reshape(X_T1.shape[0], -1, X_T1.shape[-1])
+X_T2_flat    = X_T2.reshape(X_T2.shape[0], -1, X_T2.shape[-1])
 
+# combined (train + tests)
+X_all_flat = np.concatenate([X_train_flat, X_T1_flat, X_T2_flat], axis=0)
+y_all      = np.concatenate([y_train, y_T1, y_T2], axis=0)
+
+N, W, F = X_train_flat.shape
 n_perm = 1000
-rng = np.random.default_rng(0)
 
 out_dir = Path(r"C:\Users\mnaser1\OneDrive - Kennesaw State University\Desktop\ASDSpeech-main - 2")
 out_dir.mkdir(parents=True, exist_ok=True)
 
+def compute_stats(x_feat_1d, y_col_1d, seed=0):
+    x_feat_1d = np.asarray(x_feat_1d, dtype=float)
+    y_col_1d  = np.asarray(y_col_1d,  dtype=float)
+
+    mask = np.isfinite(x_feat_1d) & np.isfinite(y_col_1d)
+    x = x_feat_1d[mask]
+    y = y_col_1d[mask]
+
+    r_obs, _ = pearsonr(x, y)
+
+    rng = np.random.default_rng(seed)
+    r_null = np.empty(n_perm)
+    for i in range(n_perm):
+        r_null[i], _ = pearsonr(x, rng.permutation(y))
+
+    thr = np.percentile(np.abs(r_null), 97.5)
+    p_emp = (np.sum(np.abs(r_null) >= np.abs(r_obs)) + 1) / (n_perm + 1)
+    sig = np.abs(r_obs) > thr
+
+    rho, p_s = pearsonr(rankdata(x), rankdata(y))  # "Spearman" via ranks
+
+    return r_obs, p_emp, sig, rho, p_s, len(x)
+
 # =========================
-# LOOP OVER ALL y COLUMNS
+# LOOP OVER y COLUMNS (START FROM 1)
 # =========================
-for c in range(2,y_train.shape[1]):
-    y_col = np.asarray(y_train[:, c], dtype=float)
+for c in range(2, y_train.shape[1]):  # skip first column
+    y_train_col = y_train[:, c]
+    y_all_col   = y_all[:, c]
 
     rows = []
 
     for j in range(F):
-        x_feat = X_train_flat[:, :, j].mean(axis=1).astype(float)
+        # one value per subject: mean over 1000 windows
+        x_train_feat = X_train_flat[:, :, j].mean(axis=1)
+        x_all_feat   = X_all_flat[:, :, j].mean(axis=1)
 
-        mask = np.isfinite(x_feat) & np.isfinite(y_col)
-        x = x_feat[mask]
-        y = y_col[mask]
+        # train-only stats
+        r_tr, pemp_tr, sig_tr, rho_tr, ps_tr, n_tr = compute_stats(
+            x_train_feat, y_train_col, seed=1000*c + j
+        )
 
-        r_obs, _ = pearsonr(x, y)
-
-        r_null = np.empty(n_perm)
-        for i in range(n_perm):
-            r_null[i], _ = pearsonr(x, rng.permutation(y))
-
-        thr = np.percentile(np.abs(r_null), 97.5)
-        p_emp = (np.sum(np.abs(r_null) >= np.abs(r_obs)) + 1) / (n_perm + 1)
-        sig = np.abs(r_obs) > thr
-
-        rho, p_s = pearsonr(rankdata(x), rankdata(y))
+        # combined stats
+        r_all, pemp_all, sig_all, rho_all, ps_all, n_all = compute_stats(
+            x_all_feat, y_all_col, seed=2000*c + j
+        )
 
         rows.append({
             "feature_idx": j,
-            "pearson_r": r_obs,
-            "pearson_p_emp": p_emp,
-            "pearson_sig": sig,
-            "spearman_rho": rho,
-            "spearman_p": p_s,
-            "n_used": len(x)
+
+            "train_pearson_r": r_tr,
+            "train_pearson_p_emp": pemp_tr,
+            "train_pearson_sig": sig_tr,
+            "train_spearman_rho": rho_tr,
+            "train_spearman_p": ps_tr,
+            "train_n_used": n_tr,
+
+            "all_pearson_r": r_all,
+            "all_pearson_p_emp": pemp_all,
+            "all_pearson_sig": sig_all,
+            "all_spearman_rho": rho_all,
+            "all_spearman_p": ps_all,
+            "all_n_used": n_all,
         })
 
     df_results = pd.DataFrame(rows)
