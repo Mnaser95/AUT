@@ -1,8 +1,18 @@
 # model_family_benchmark.py
 # Same pipeline you validated, but lets you swap model families:
-#   - "cnn_replica" (current)
+#   - "cnn_replica"
 #   - "transformer"
 #   - "contrastive_simclr"
+#
+# NEW FUNCTIONALITY:
+# - You choose ONE target column via TARGET_COL_IDX.
+# - If TARGET_COL_IDX is 2 or 3, you can OPTIONALLY switch the task from regression to
+#   binary classification (low/high) using FORCE_CLASSIFICATION_FOR_2_3.
+# - Threshold is computed from TRAIN ONLY (default: median of y_train for that column).
+#
+# Evaluation:
+# - Regression: RMSE, NRMSE(range), MAE (on T1 and T2)
+# - Classification: ACC, F1, AUC + confusion counts (on T1 and T2)
 
 from data_import import load_all_data
 from pathlib import Path
@@ -17,13 +27,21 @@ SEED = 42
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 
+# Choose ONE column at a time
 TARGET_COL_IDX = 3
+
 EXCLUDE_MODULE_4 = False
 MODULE_IDX = 10
-REPLICATE_Y_SCALING = True
+
+# Regression-only option (ignored for classification)
+REPLICATE_Y_SCALING = True  # y_train -> y_train/max(y_train) and rescale preds back
+
+# If TARGET_COL_IDX in {2,3}, you can optionally do classification instead of regression
+FORCE_CLASSIFICATION_FOR_2_3 = True
+THRESHOLD_METHOD = "median"  # "median" (train-only). Extendable.
 
 # Choose one:
-MODEL_FAMILY = "contrastive_simclr"         # "cnn_replica" | "transformer" | "contrastive_simclr"
+MODEL_FAMILY = "contrastive_simclr"  # "cnn_replica" | "transformer" | "contrastive_simclr"
 
 # Training
 BATCH_SIZE = 16
@@ -37,6 +55,7 @@ PRETRAIN_LR = 1e-3
 PROJ_DIM = 128
 TEMPERATURE = 0.2
 
+# Paths
 ROOT = Path(r"C:\Users\mnaser1\OneDrive - Kennesaw State University\Desktop\ASDSpeech-main - 2")
 TRAIN_MAT = ROOT / r"data\training\train_data.mat"
 TRAIN_IDS = ROOT / r"data\training\ids_fixed.mat"
@@ -46,7 +65,7 @@ OUT_DIR = ROOT / "ml_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
-# HELPERS (same as yours)
+# HELPERS
 # =========================
 def module_is_4(arr):
     a = np.asarray(arr)
@@ -100,6 +119,7 @@ def make_ds(X, y, batch_size, shuffle=False):
         ds = ds.shuffle(min(len(y), 5000), seed=SEED, reshuffle_each_iteration=True)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
+# ---------- regression evaluation ----------
 def nrmse(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=np.float32)
     y_pred = np.asarray(y_pred, dtype=np.float32)
@@ -107,33 +127,77 @@ def nrmse(y_true, y_pred):
     denom = (np.max(y_true) - np.min(y_true)) + 1e-8
     return float(rmse / denom)
 
-def evaluate_nrmse(model, X, y, name, y_scale=1.0, out_path=None):
+def evaluate_regression(model, X, y, name, y_scale=1.0, out_path=None):
     y = np.asarray(y, dtype=np.float32).reshape(-1)
     y_pred = model.predict(X, batch_size=BATCH_SIZE, verbose=0).reshape(-1).astype(np.float32)
     y_pred = y_pred * float(y_scale)
 
-    rmse = float(np.sqrt(np.mean((y_pred - y) ** 2)))
-    mae = float(np.mean(np.abs(y_pred - y)))
-    nn = float(nrmse(y, y_pred))
+    rmse_val = float(np.sqrt(np.mean((y_pred - y) ** 2)))
+    mae_val = float(np.mean(np.abs(y_pred - y)))
+    nrmse_val = float(nrmse(y, y_pred))
 
-    print(f"{name} → RMSE={rmse:.4f}, NRMSE={nn:.4f}, MAE={mae:.4f}")
+    print(f"{name} → RMSE={rmse_val:.4f}, NRMSE={nrmse_val:.4f}, MAE={mae_val:.4f}")
 
     if out_path is not None:
         pd.DataFrame({"y_true": y, "y_pred": y_pred, "error": y_pred - y}).to_csv(out_path, index=False)
 
-    return {"rmse": rmse, "nrmse": nn, "mae": mae}
+    return {"rmse": rmse_val, "nrmse": nrmse_val, "mae": mae_val}
 
+# ---------- classification preparation + evaluation ----------
+def get_threshold(y_train, method="median"):
+    y_train = np.asarray(y_train, dtype=np.float32)
+    if method == "median":
+        return float(np.median(y_train))
+    raise ValueError("THRESHOLD_METHOD must be 'median'")
+
+def to_binary(y, thr):
+    y = np.asarray(y, dtype=np.float32)
+    return (y >= float(thr)).astype(np.float32)
+
+def _f1_acc_from_probs(y_true01, y_prob, thr=0.5):
+    y_true01 = y_true01.astype(np.int32)
+    y_hat = (y_prob >= thr).astype(np.int32)
+
+    tp = int(np.sum((y_hat == 1) & (y_true01 == 1)))
+    tn = int(np.sum((y_hat == 0) & (y_true01 == 0)))
+    fp = int(np.sum((y_hat == 1) & (y_true01 == 0)))
+    fn = int(np.sum((y_hat == 0) & (y_true01 == 1)))
+
+    acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    prec = tp / (tp + fp + 1e-8)
+    rec = tp / (tp + fn + 1e-8)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+    return float(f1), float(acc), tp, fp, fn, tn
+
+def evaluate_classification(model, X, y_true01, name, out_path=None):
+    y_true01 = np.asarray(y_true01, dtype=np.float32).reshape(-1)
+    y_prob = model.predict(X, batch_size=BATCH_SIZE, verbose=0).reshape(-1).astype(np.float32)
+
+    # AUC (edge-case safe)
+    try:
+        auc = float(tf.keras.metrics.AUC()(y_true01, y_prob).numpy())
+    except Exception:
+        auc = float("nan")
+
+    f1, acc, tp, fp, fn, tn = _f1_acc_from_probs(y_true01, y_prob, thr=0.5)
+    print(f"{name} → ACC={acc:.4f}, F1={f1:.4f}, AUC={auc:.4f} | TP={tp}, FP={fp}, FN={fn}, TN={tn}")
+
+    if out_path is not None:
+        pd.DataFrame({"y_true": y_true01, "y_prob": y_prob}).to_csv(out_path, index=False)
+
+    return {"acc": acc, "f1": f1, "auc": auc, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 # =========================
-# FAMILY A: CNN replica (your current)
+# MODEL FAMILIES (support both tasks)
 # =========================
-def build_cnn_replica(input_shape, lr=1e-3):
+def build_cnn_replica(input_shape, lr=1e-3, task="regression"):
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import Conv1D, MaxPool1D, Dense, Dropout, Flatten
     from tensorflow.keras.optimizers import RMSprop
     from tensorflow.keras.initializers import RandomUniform
 
     init = RandomUniform(seed=1)
+    out_activation = "sigmoid" if task == "classification" else "linear"
 
     model = Sequential([
         Conv1D(256, 3, activation="relu", input_shape=input_shape, kernel_initializer=init),
@@ -146,21 +210,25 @@ def build_cnn_replica(input_shape, lr=1e-3):
         Dense(256, activation="relu", kernel_initializer=init),
         Dense(128, activation="relu", kernel_initializer=init),
         Flatten(),
-        Dense(1, activation="linear", kernel_initializer=init),
+        Dense(1, activation=out_activation, kernel_initializer=init),
     ])
 
-    model.compile(
-        optimizer=RMSprop(learning_rate=lr),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
-                 tf.keras.metrics.MeanAbsoluteError(name="mae")]
-    )
+    if task == "classification":
+        model.compile(
+            optimizer=RMSprop(learning_rate=lr),
+            loss="binary_crossentropy",
+            metrics=[tf.keras.metrics.BinaryAccuracy(name="acc"),
+                     tf.keras.metrics.AUC(name="auc")]
+        )
+    else:
+        model.compile(
+            optimizer=RMSprop(learning_rate=lr),
+            loss="mse",
+            metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
+                     tf.keras.metrics.MeanAbsoluteError(name="mae")]
+        )
     return model
 
-
-# =========================
-# FAMILY B: Transformer regressor
-# =========================
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class TransformerBlock(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1, **kwargs):
@@ -197,11 +265,8 @@ class TransformerBlock(tf.keras.layers.Layer):
         })
         return config
 
-
-def build_transformer_regressor(input_shape, lr=1e-3, d_model=128, num_heads=4, d_ff=256, n_blocks=3):
-    inp = tf.keras.Input(shape=input_shape)  # (T, F)
-
-    # Project features to d_model
+def build_transformer(input_shape, lr=1e-3, task="regression", d_model=128, num_heads=4, d_ff=256, n_blocks=3):
+    inp = tf.keras.Input(shape=input_shape)
     x = tf.keras.layers.Dense(d_model)(inp)
 
     for _ in range(n_blocks):
@@ -210,35 +275,35 @@ def build_transformer_regressor(input_shape, lr=1e-3, d_model=128, num_heads=4, 
     x = tf.keras.layers.GlobalAveragePooling1D()(x)
     x = tf.keras.layers.Dense(256, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.2)(x)
-    out = tf.keras.layers.Dense(1)(x)
 
-    model = tf.keras.Model(inp, out)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
-                 tf.keras.metrics.MeanAbsoluteError(name="mae")]
-    )
+    if task == "classification":
+        out = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+        model = tf.keras.Model(inp, out)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss="binary_crossentropy",
+            metrics=[tf.keras.metrics.BinaryAccuracy(name="acc"),
+                     tf.keras.metrics.AUC(name="auc")]
+        )
+    else:
+        out = tf.keras.layers.Dense(1)(x)
+        model = tf.keras.Model(inp, out)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss="mse",
+            metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
+                     tf.keras.metrics.MeanAbsoluteError(name="mae")]
+        )
     return model
 
-
-# =========================
-# FAMILY C: Contrastive (SimCLR-ish) pretraining + regression
-# =========================
+# ---------- Contrastive (SimCLR-ish) ----------
 def augment_time_series(x):
-    """
-    x: (T, F) float32
-    Simple augmentations: jitter + scaling + time masking.
-    """
-    # jitter
     noise = tf.random.normal(tf.shape(x), mean=0.0, stddev=0.03)
     x1 = x + noise
 
-    # scaling
     scale = tf.random.uniform([], 0.9, 1.1)
     x1 = x1 * scale
 
-    # time mask
     T = tf.shape(x1)[0]
     mask_len = tf.cast(tf.maximum(1, T // 20), tf.int32)
     start = tf.random.uniform([], 0, tf.maximum(1, T - mask_len), dtype=tf.int32)
@@ -251,7 +316,7 @@ def augment_time_series(x):
 
     return x1
 
-def build_encoder(input_shape, d_model=128):
+def build_encoder(input_shape, d_model=256):
     inp = tf.keras.Input(shape=input_shape)
     x = tf.keras.layers.Conv1D(128, 7, strides=2, padding="same", activation="relu")(inp)
     x = tf.keras.layers.Conv1D(256, 5, strides=2, padding="same", activation="relu")(x)
@@ -267,9 +332,6 @@ def build_projection_head(d_in, proj_dim=128):
     return tf.keras.Model(inp, out, name="proj_head")
 
 def nt_xent_loss(z1, z2, temperature=0.2):
-    """
-    z1, z2: (B, D) normalized
-    """
     z1 = tf.math.l2_normalize(z1, axis=1)
     z2 = tf.math.l2_normalize(z2, axis=1)
 
@@ -278,16 +340,14 @@ def nt_xent_loss(z1, z2, temperature=0.2):
 
     B = tf.shape(z1)[0]
     labels = tf.range(B)
+
     loss_12 = tf.keras.losses.sparse_categorical_crossentropy(labels, logits_12, from_logits=True)
     loss_21 = tf.keras.losses.sparse_categorical_crossentropy(labels, logits_21, from_logits=True)
     return tf.reduce_mean(loss_12 + loss_21) * 0.5
 
 def pretrain_contrastive(X_train, input_shape):
-    # Dataset that emits two augmented views
     def map_views(x):
-        v1 = augment_time_series(x)
-        v2 = augment_time_series(x)
-        return v1, v2
+        return augment_time_series(x), augment_time_series(x)
 
     ds = tf.data.Dataset.from_tensor_slices(X_train.astype(np.float32))
     ds = ds.shuffle(min(len(X_train), 5000), seed=SEED, reshuffle_each_iteration=True)
@@ -318,26 +378,35 @@ def pretrain_contrastive(X_train, input_shape):
             losses.append(train_step(v1, v2))
         print(f"[Pretrain] Epoch {ep:03d} | loss={tf.reduce_mean(losses).numpy():.4f}")
 
-    return encoder  # return pretrained encoder only
+    return encoder
 
-def build_regressor_from_encoder(encoder, input_shape, lr=1e-3, finetune=True):
+def build_head_from_encoder(encoder, input_shape, lr=1e-3, task="regression", finetune=True):
     inp = tf.keras.Input(shape=input_shape)
     h = encoder(inp, training=finetune)
     x = tf.keras.layers.Dense(256, activation="relu")(h)
     x = tf.keras.layers.Dropout(0.2)(x)
-    out = tf.keras.layers.Dense(1)(x)
-    model = tf.keras.Model(inp, out)
 
-    encoder.trainable = bool(finetune)
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
-                 tf.keras.metrics.MeanAbsoluteError(name="mae")]
-    )
+    if task == "classification":
+        out = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+        model = tf.keras.Model(inp, out)
+        encoder.trainable = bool(finetune)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss="binary_crossentropy",
+            metrics=[tf.keras.metrics.BinaryAccuracy(name="acc"),
+                     tf.keras.metrics.AUC(name="auc")]
+        )
+    else:
+        out = tf.keras.layers.Dense(1)(x)
+        model = tf.keras.Model(inp, out)
+        encoder.trainable = bool(finetune)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss="mse",
+            metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse"),
+                     tf.keras.metrics.MeanAbsoluteError(name="mae")]
+        )
     return model
-
 
 # =========================
 # MAIN
@@ -369,7 +438,9 @@ def main():
     yt = to_float_1d(y_T2[:, TARGET_COL_IDX])
 
     # drop NaNs from target conversion
-    tr_ok = np.isfinite(ytr); v_ok = np.isfinite(yv); t_ok = np.isfinite(yt)
+    tr_ok = np.isfinite(ytr)
+    v_ok = np.isfinite(yv)
+    t_ok = np.isfinite(yt)
     X_train, ytr = X_train[tr_ok], ytr[tr_ok]
     X_T1, yv = X_T1[v_ok], yv[v_ok]
     X_T2, yt = X_T2[t_ok], yt[t_ok]
@@ -380,65 +451,122 @@ def main():
     X_T1 = zscore_apply(X_T1, mean, std)
     X_T2 = zscore_apply(X_T2, mean, std)
 
-    # y scaling (optional replication)
-    y_scale = 1.0
-    if REPLICATE_Y_SCALING:
-        y_scale = float(np.max(ytr))
-        ytr_fit = (ytr / (y_scale + 1e-8)).astype(np.float32)
-        yv_fit = (yv / (y_scale + 1e-8)).astype(np.float32)
-    else:
-        ytr_fit = ytr.astype(np.float32)
-        yv_fit = yv.astype(np.float32)
-
-    ds_train = make_ds(X_train, ytr_fit, BATCH_SIZE, shuffle=True)
-    ds_val = make_ds(X_T1, yv_fit, BATCH_SIZE, shuffle=False)
-
     input_shape = (X_train.shape[1], X_train.shape[2])
 
-    # pick family
+    # Decide task
+    task = "regression"
+    if TARGET_COL_IDX in (2, 3) and FORCE_CLASSIFICATION_FOR_2_3:
+        task = "classification"
+
+    # Prepare labels/datasets
+    thr = None
+    y_scale = 1.0
+
+    if task == "classification":
+        thr = get_threshold(ytr, method=THRESHOLD_METHOD)
+        ytr_fit = to_binary(ytr, thr)
+        yv_fit = to_binary(yv, thr)
+
+        ds_train = make_ds(X_train, ytr_fit, BATCH_SIZE, shuffle=True)
+        ds_val = make_ds(X_T1, yv_fit, BATCH_SIZE, shuffle=False)
+
+    else:
+        if REPLICATE_Y_SCALING:
+            y_scale = float(np.max(ytr))
+            ytr_fit = (ytr / (y_scale + 1e-8)).astype(np.float32)
+            yv_fit = (yv / (y_scale + 1e-8)).astype(np.float32)
+        else:
+            ytr_fit = ytr.astype(np.float32)
+            yv_fit = yv.astype(np.float32)
+
+        ds_train = make_ds(X_train, ytr_fit, BATCH_SIZE, shuffle=True)
+        ds_val = make_ds(X_T1, yv_fit, BATCH_SIZE, shuffle=False)
+
+    # Build model
     if MODEL_FAMILY == "cnn_replica":
-        model = build_cnn_replica(input_shape, lr=LR)
+        model = build_cnn_replica(input_shape, lr=LR, task=task)
     elif MODEL_FAMILY == "transformer":
-        model = build_transformer_regressor(input_shape, lr=LR)
+        model = build_transformer(input_shape, lr=LR, task=task)
     elif MODEL_FAMILY == "contrastive_simclr":
         encoder = pretrain_contrastive(X_train, input_shape=input_shape)
-        model = build_regressor_from_encoder(encoder, input_shape=input_shape, lr=LR, finetune=True)
+        model = build_head_from_encoder(encoder, input_shape=input_shape, lr=LR, task=task, finetune=True)
     else:
         raise ValueError(f"Unknown MODEL_FAMILY: {MODEL_FAMILY}")
 
-    tag = f"{MODEL_FAMILY}_col{TARGET_COL_IDX}" + ("_yScaled" if REPLICATE_Y_SCALING else "_yRaw")
+    # tags / outputs
+    tag = f"{MODEL_FAMILY}_col{TARGET_COL_IDX}_{task}"
+    if task == "classification":
+        tag += f"_{THRESHOLD_METHOD}"
+    else:
+        tag += "_yScaled" if REPLICATE_Y_SCALING else "_yRaw"
+
     ckpt_path = OUT_DIR / f"best_{tag}.keras"
 
+    # Choose monitor
+    monitor = "val_auc" if task == "classification" else "val_rmse"
+    mode = "max" if task == "classification" else "min"
+
     callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(str(ckpt_path), monitor="val_rmse", mode="min",
-                                           save_best_only=True, verbose=1),
-        tf.keras.callbacks.EarlyStopping(monitor="val_rmse", mode="min",
-                                         patience=PATIENCE, restore_best_weights=True, verbose=1),
+        tf.keras.callbacks.ModelCheckpoint(
+            str(ckpt_path), monitor=monitor, mode=mode, save_best_only=True, verbose=1
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor, mode=mode, patience=PATIENCE, restore_best_weights=True, verbose=1
+        ),
         tf.keras.callbacks.CSVLogger(str(OUT_DIR / f"history_{tag}.csv"), append=False),
     ]
 
     model.fit(ds_train, validation_data=ds_val, epochs=EPOCHS, callbacks=callbacks, verbose=1)
 
-    # Evaluate NRMSE on T1 and T2 (always in original y units)
-    res_T1 = evaluate_nrmse(
-        model, X_T1, yv, "T1 (eval)", y_scale=y_scale,
-        out_path=OUT_DIR / f"preds_T1_{tag}.csv"
-    )
-    res_T2 = evaluate_nrmse(
-        model, X_T2, yt, "T2 (test)", y_scale=y_scale,
-        out_path=OUT_DIR / f"preds_T2_{tag}.csv"
-    )
+    # Evaluate on T1 + T2
+    if task == "classification":
+        yv_bin = to_binary(yv, thr)
+        yt_bin = to_binary(yt, thr)
 
-    # Save metrics
-    metrics_path = OUT_DIR / f"metrics_{tag}.csv"
-    pd.DataFrame({
-        "split": ["T1", "T2"],
-        "rmse": [res_T1["rmse"], res_T2["rmse"]],
-        "nrmse_range": [res_T1["nrmse"], res_T2["nrmse"]],
-        "mae": [res_T1["mae"], res_T2["mae"]],
-    }).to_csv(metrics_path, index=False)
-    print(f"Saved: {metrics_path}")
-    print(f"Saved model: {ckpt_path}")
+        res_T1 = evaluate_classification(
+            model, X_T1, yv_bin, "T1 (eval)",
+            out_path=OUT_DIR / f"preds_T1_{tag}.csv"
+        )
+        res_T2 = evaluate_classification(
+            model, X_T2, yt_bin, "T2 (test)",
+            out_path=OUT_DIR / f"preds_T2_{tag}.csv"
+        )
+
+        metrics_path = OUT_DIR / f"metrics_{tag}.csv"
+        pd.DataFrame({
+            "split": ["T1", "T2"],
+            "acc": [res_T1["acc"], res_T2["acc"]],
+            "f1": [res_T1["f1"], res_T2["f1"]],
+            "auc": [res_T1["auc"], res_T2["auc"]],
+            "thr": [thr, thr],
+            "tp": [res_T1["tp"], res_T2["tp"]],
+            "fp": [res_T1["fp"], res_T2["fp"]],
+            "fn": [res_T1["fn"], res_T2["fn"]],
+            "tn": [res_T1["tn"], res_T2["tn"]],
+        }).to_csv(metrics_path, index=False)
+        print(f"Saved: {metrics_path}")
+        print(f"Saved model: {ckpt_path}")
+
+    else:
+        res_T1 = evaluate_regression(
+            model, X_T1, yv, "T1 (eval)", y_scale=y_scale,
+            out_path=OUT_DIR / f"preds_T1_{tag}.csv"
+        )
+        res_T2 = evaluate_regression(
+            model, X_T2, yt, "T2 (test)", y_scale=y_scale,
+            out_path=OUT_DIR / f"preds_T2_{tag}.csv"
+        )
+
+        metrics_path = OUT_DIR / f"metrics_{tag}.csv"
+        pd.DataFrame({
+            "split": ["T1", "T2"],
+            "rmse": [res_T1["rmse"], res_T2["rmse"]],
+            "nrmse_range": [res_T1["nrmse"], res_T2["nrmse"]],
+            "mae": [res_T1["mae"], res_T2["mae"]],
+            "y_scale_used": [y_scale, y_scale],
+        }).to_csv(metrics_path, index=False)
+        print(f"Saved: {metrics_path}")
+        print(f"Saved model: {ckpt_path}")
 
 
 if __name__ == "__main__":
